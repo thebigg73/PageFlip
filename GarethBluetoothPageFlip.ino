@@ -1,5 +1,6 @@
 #include <BleKeyboard.h>
 
+#include "esp_wifi.h"
 #include <esp_bt.h>
 
 // Set up the pin numbers for the buttons
@@ -29,8 +30,9 @@ int pressedLEDState = HIGH;
 // The last time LED was updated
 unsigned long previousMillis = 0;
 // Interval at which to blink (milliseconds)
-const long notconnectedInterval = 200;
-const long connectedInterval = 1000;
+const long notconnectedInterval = 500;
+const long connectedInterval = 5000;
+const long ledOnInterval = 50;
 
 // First param is name of the pedal
 // Second is manufacturer
@@ -40,6 +42,13 @@ BleKeyboard bleKeyboard("PageFlip", "OpenSongApp", 100);
 void setup() {
   Serial.begin(115200);
   //pinMode(pinLEDOnboard, OUTPUT);
+  
+  // Disable WiFi
+  esp_wifi_stop();
+  
+  // Initialize Bluetooth (example)
+  btStop();
+
   pinMode(pinLEDPress,OUTPUT);
   pinMode(pinLEDConnected,OUTPUT);
   pinMode(pinButton1,INPUT_PULLUP);
@@ -152,7 +161,11 @@ void loop() {
 
   int interval;
   if (bleKeyboard.isConnected()) {
-    interval = connectedInterval;
+    if (connectedLEDState == HIGH) {
+      interval = ledOnInterval;
+    } else {
+      interval = connectedInterval;
+    }
   } else {
     interval = notconnectedInterval;
   }
