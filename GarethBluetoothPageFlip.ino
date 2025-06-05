@@ -1,6 +1,5 @@
-#include <BleKeyboard.h>
-
 // The libraries used
+#include <BleKeyboard.h>
 extern "C" esp_err_t esp_wifi_stop(void);
 #include <esp_bt.h>
 
