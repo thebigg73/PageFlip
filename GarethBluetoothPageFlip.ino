@@ -1,202 +1,176 @@
 #include <BleKeyboard.h>
 
-#include "esp_wifi.h"
+// The libraries used
+extern "C" esp_err_t esp_wifi_stop(void);
 #include <esp_bt.h>
 
-// Set up the pin numbers for the buttons
-const int pinButton1 = 12;
-const int pinButton2 = 14;
-const int pinButton3 = 27;
-const int pinButton4 = 26;
-const int pinButton5 = 25;
+// The button information that can be changed
+// Each array should have the same number of entries
+// The first array is the pins to use for the footswitch controls
+// I have this code set up to use up to 5 switches on a foot pedal (you can use less)
+const int buttonPins[] = {12,  // 1
+                          14,  // 2
+                          27,  // 3
+                          26,  // 4
+                          25}; // 5
 
-// Set up the pin numbers for the LEDs
-// const int pinLEDOnboard = 36;
-const int pinLEDPress = 33;
-const int pinLEDConnected = 32;
+// The next array is the keycode that is sent when each footswitch/pin above is pressed
+const int keyCodes[] = {KEY_LEFT_ARROW,  // 1
+                        KEY_RIGHT_ARROW, // 2
+                        KEY_UP_ARROW,    // 3
+                        KEY_DOWN_ARROW,  // 4
+                        KEY_HOME};       // 5
 
-// Because we connect to GND we use reverse HIGH/LOW logic
-// HIGH = off, LOW = on
-// Set up the pin states (track changes)
-int button1State = HIGH;
-int button2State = HIGH;
-int button3State = HIGH;
-int button4State = HIGH;
-int button5State = HIGH;
-int connectedLEDState = HIGH;
-int pressedLEDState = HIGH;
+// Finally the default button state when starting - each should be BUTTON_RELEASED
+int buttonStates[buttonCount] = {BUTTON_RELEASED, // 1
+                                BUTTON_RELEASED,  // 2
+                                BUTTON_RELEASED,  // 3
+                                BUTTON_RELEASED,  // 4 
+                                BUTTON_RELEASED}; // 5
 
-// Variables for blinking the Bluetooth LED
-// The last time LED was updated
+// You shouldn't need to change any of the code below unless you want to change how the pedal functions
+bool debug = false;
+#define DBG(...) if (debug) Serial.printf(__VA_ARGS__)
+
+// The state for on/off as high/low states
+constexpr int LED_ON  = HIGH;
+constexpr int LED_OFF = LOW;
+
+// Buttons pulled-up, so LOW means pressed
+constexpr int BUTTON_PRESSED = LOW;  
+constexpr int BUTTON_RELEASED = HIGH;
+int connectedLEDState = LED_OFF;
+
+// Check the array sizes match
+constexpr size_t buttonCount = sizeof(buttonPins) / sizeof(buttonPins[0]);
+constexpr size_t keyCount = sizeof(keyCodes) / sizeof(keyCodes[0]);
+static_assert(buttonCount == keyCount, "Mismatch between buttonPins and keyCodes");
+
+// The pins to use for the LEDs
+constexpr int pinLEDPress = 33;
+constexpr int pinLEDConnected = 32;
+
+// The timings for flashes (when paired/not paired)
 unsigned long previousMillis = 0;
-// Interval at which to blink (milliseconds)
-const long notconnectedInterval = 500;
+const long notConnectedInterval = 500;
 const long connectedInterval = 5000;
 const long ledOnInterval = 50;
 
-// First param is name of the pedal
-// Second is manufacturer
-// Third is initial battery level
+// The settings for registering and flashing when buttons are pressed
+bool pressLEDActive = false;
+unsigned long pressLEDMillis = 0;
+constexpr unsigned long pressLEDDuration = 100;  // milliseconds
+
+// Debounce tries to avoid flickers/multiple commands rapidly due to intermittent connections
+unsigned long lastDebounceTime[buttonCount] = {0};
+constexpr unsigned long debounceDelay = 20;
+
+// Define the starting device name, manufacturer and initial battery charge
 BleKeyboard bleKeyboard("PageFlip", "OpenSongApp", 100);
 
+// Setup code initialises all of the settings for the pedal
 void setup() {
+  // Start the system and log this
   Serial.begin(115200);
-  //pinMode(pinLEDOnboard, OUTPUT);
-  
-  // Disable WiFi
+  Serial.println("PageFlip Pedal starting...");
+  Serial.flush();
+
+  // Turn of WiFi for power optimisation
   esp_wifi_stop();
-  
-  // Initialize Bluetooth (example)
-  btStop();
 
-  pinMode(pinLEDPress,OUTPUT);
-  pinMode(pinLEDConnected,OUTPUT);
-  pinMode(pinButton1,INPUT_PULLUP);
-  pinMode(pinButton2,INPUT_PULLUP);
-  pinMode(pinButton3,INPUT_PULLUP);
-  pinMode(pinButton4,INPUT_PULLUP);
-  pinMode(pinButton5,INPUT_PULLUP);
-  digitalWrite(pinLEDPress,pressedLEDState);
-  digitalWrite(pinLEDConnected,connectedLEDState);
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9); 
+  // Set the mode of the led pins as outputs
+  pinMode(pinLEDPress, OUTPUT);
+  pinMode(pinLEDConnected, OUTPUT);
+
+  // For each button pin, initialise it as a input_pullup
+  for (size_t i = 0; i < buttonCount; i++) {
+    pinMode(buttonPins[i], INPUT_PULLUP);
+  }
+
+  // Start with the LEDs off
+  digitalWrite(pinLEDPress, LED_OFF);
+  digitalWrite(pinLEDConnected, connectedLEDState);
+
+  // Use maximum Bluetooth power (better range).
+  // If range isn't an issue, you can lower to ESP_PWR_LVL_P3 or ESP_PWR_LVL_DEFAULT
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN ,ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
+
+  // Start the keyboard function and wait for a short period for initialisation
   bleKeyboard.begin();
+  delay(100);
 }
 
+// This next part is the code that constantly runs in the background
 void loop() {
-  // Check the key press state
-  int new_button1State = digitalRead(pinButton1);
-  int new_button2State = digitalRead(pinButton2);
-  int new_button3State = digitalRead(pinButton3);
-  int new_button4State = digitalRead(pinButton4);
-  int new_button5State = digitalRead(pinButton5);
-  
-  boolean ispressed1 = (new_button1State == LOW);
-  boolean ispressed2 = (new_button2State == LOW);
-  boolean ispressed3 = (new_button3State == LOW);
-  boolean ispressed4 = (new_button4State == LOW);
-  boolean ispressed5 = (new_button5State == LOW);
+  // The lastButtonState is part of the debounce check
+  static int lastButtonState[buttonCount] = {BUTTON_RELEASED};
 
-  // If we have pressed a button, light the LED, otherwise turn it off)
-  triggerPressLED(ispressed1 || ispressed2 || 
-    ispressed3 || ispressed4 || ispressed5);
+  // Go through the buttons and see if any have changed state on/off and haven't been a debouce
+  for (size_t i = 0; i < buttonCount; i++) {
+    int currentState = digitalRead(buttonPins[i]);
 
-  if (button1State != new_button1State) {
-    // We have changed the button state, so need to do something
-    button1State = new_button1State;
-    if (new_button1State == LOW) {
-      // We have pressed the first button (left arrow)
-      Serial.print("\nButton1 pressed");
-      sendKey(KEY_LEFT_ARROW,true);
-    } else {
-      Serial.print("\nButton1 released");
-      sendKey(KEY_LEFT_ARROW,false);
-    }
-  }
-  
-  if (button2State != new_button2State) {
-    // We have changed the button state, so need to do something
-    button2State = new_button2State;
-    if (new_button2State == LOW) {
-      // We have pressed the second button (right arrow)
-      Serial.print("\nButton2 pressed");
-      sendKey(KEY_RIGHT_ARROW,true);
-    } else {
-      Serial.print("\nButton2 released");
-      sendKey(KEY_RIGHT_ARROW,false);
+    if (currentState != lastButtonState[i]) {
+      if ((millis() - lastDebounceTime[i]) > debounceDelay) {
+        lastDebounceTime[i] = millis();
+        lastButtonState[i] = currentState;
+        
+        // If a button was pressed, send the matching keycode as a keydown event
+        if (currentState == BUTTON_PRESSED) {
+          DBG("\nButton %d pressed", i + 1);
+          sendKey(keyCodes[i], true);
+
+        // Otherwise, send the matching keycode as a keyup event
+        } else {
+          DBG("\nButton %d released", i + 1);
+          sendKey(keyCodes[i], false);
+          triggerPressLED();
+        }
+      }
     }
   }
 
-  if (button3State != new_button3State) {
-    // We have changed the button state, so need to do something
-    button3State = new_button3State;
-    if (new_button3State == LOW) {
-      // We have pressed the third button (up arrow)
-      Serial.print("\nButton3 pressed");
-      sendKey(KEY_UP_ARROW,true);
-    } else {
-      Serial.print("\nButton3 released");
-      sendKey(KEY_UP_ARROW,false);
-    }
-  }
-
-  if (button4State != new_button4State) {
-    // We have changed the button state, so need to do something
-    button4State = new_button4State;
-    if (new_button4State == LOW) {
-      // We have pressed the fourth button (down arrow)
-      Serial.print("\nButton4 pressed");
-      sendKey(KEY_DOWN_ARROW,true);
-    } else {
-      Serial.print("\nButton4 released");
-      sendKey(KEY_DOWN_ARROW,false);
-    }
-  }
-
-  if (button5State != new_button5State) {
-    // We have changed the button state, so need to do something
-    button5State = new_button5State;
-    if (new_button5State == LOW) {
-      // We have pressed the fifth button (home)
-      Serial.print("\nButton5 pressed");
-      sendKey(KEY_HOME,true);
-    } else {
-      Serial.print("\nButton5 released");
-      sendKey(KEY_HOME,false);
-    }
-  }
-
+  // Update the led press to off and check the connected led pulse
+  updatePressLED();
   connectedLEDPulse();
-
-  // Allow for flickering on/off as connection is made
-  delay(50);
 }
 
- void connectedLEDPulse() {
-  // check to see if it's time to blink the LED; that is, if the difference
-  // between the current time and last time you blinked the LED is bigger than
-  // the interval at which you want to blink the LED.
+// Pulse the led to show it isn't paired (fast), or is connected (slow with quick flash)
+void connectedLEDPulse() {
   unsigned long currentMillis = millis();
-
   int interval;
+
   if (bleKeyboard.isConnected()) {
-    if (connectedLEDState == HIGH) {
-      interval = ledOnInterval;
-    } else {
-      interval = connectedInterval;
-    }
+    interval = (connectedLEDState == LED_ON) ? ledOnInterval : connectedInterval;
   } else {
-    interval = notconnectedInterval;
+    interval = notConnectedInterval;
   }
-  
+
   if (currentMillis - previousMillis >= interval) {
-    // save the last time you blinked the LED
     previousMillis = currentMillis;
-
-    // if the LED is off turn it on and vice-versa:
-    if (connectedLEDState == LOW) {
-      connectedLEDState = HIGH;
-    } else {
-      connectedLEDState = LOW;
-    }
-
-    // set the LED with the ledState of the variable:
+    connectedLEDState = (connectedLEDState == LED_ON) ? LED_OFF : LED_ON;
     digitalWrite(pinLEDConnected, connectedLEDState);
   }
 }
 
-void triggerPressLED(boolean ispressed) {
-  pressedLEDState = ispressed;
-  if (ispressed) {
-    digitalWrite(pinLEDPress,HIGH);
-  } else {
-    digitalWrite(pinLEDPress,LOW);
+// Switch the button pressed led on
+void triggerPressLED() {
+  digitalWrite(pinLEDPress, LED_ON);
+  pressLEDActive = true;
+  pressLEDMillis = millis();
+}
+
+// Turn off the button pressed led after a pause
+void updatePressLED() {
+  if (pressLEDActive && (millis() - pressLEDMillis >= pressLEDDuration)) {
+    digitalWrite(pinLEDPress, LED_OFF);
+    pressLEDActive = false;
   }
 }
 
-void sendKey(int keyCode, boolean keyDown) {
-  // Only try to send the command if we are connected
+// Send the keycode and keyup/keydown via Bluetooth
+void sendKey(int keyCode, bool keyDown) {
   if (bleKeyboard.isConnected()) {
     if (keyDown) {
       bleKeyboard.press(keyCode);
